@@ -3,6 +3,7 @@
 #include <bitset>
 #include <cmath>
 #include <STM32FreeRTOS.h>
+#include <utility>
 
 // Constants
 const uint32_t interval = 100; // Display update interval
@@ -40,9 +41,81 @@ volatile uint32_t currentStepSize;
 // Display driver object
 U8G2_SSD1305_128X32_NONAME_F_HW_I2C u8g2(U8G2_R0);
 
+class Knob {
+public:
+    Knob() : minRotation_(0), maxRotation_(8), rotation_(0), prevDirection_(0), selected_(false), prevBA_({0,0}) {}
+
+    // Update rotation value using the latest state of the quadrature inputs
+    void updateRotation(std::pair<int, int> prev, std::pair<int, int> current) {
+        // Rotation update logic remains the same
+        if (prev.first == 0 && prev.second == 0 && current.first == 0 && current.second == 1) {
+            rotation_ ++;
+            prevDirection_ = 1;
+        } else if (prev.first == 0 && prev.second == 1 && current.first == 0 && current.second == 0) {
+            rotation_ --;
+            prevDirection_ = -1;
+        } else if (prev.first == 1 && prev.second == 0 && current.first == 1 && current.second == 1) {
+            rotation_ --;
+            prevDirection_ = -1;
+        } else if (prev.first == 1 && prev.second == 1 && current.first == 1 && current.second == 0) {
+            rotation_ ++;
+            prevDirection_ = 1;
+        } else if (prev.first == 0 && prev.second == 0 && current.first == 1 && current.second == 1) {
+            rotation_ += prevDirection_;
+        } else if (prev.first == 0 && prev.second == 1 && current.first == 1 && current.second == 0) {
+            rotation_ += prevDirection_;
+        } else if (prev.first == 1 && prev.second == 0 && current.first == 0 && current.second == 1) {
+            rotation_ += prevDirection_;
+        } else if (prev.first == 1 && prev.second == 1 && current.first == 0 && current.second == 0) {
+            rotation_ += prevDirection_;
+        }
+        
+        // Ensure rotation is within bounds
+        if (rotation_ > maxRotation_) {
+            rotation_ = maxRotation_;
+        } else if (rotation_ < minRotation_) {
+            rotation_ = minRotation_;
+        }
+        // Update previous BA
+        prevBA_ = current;
+    }
+
+    // Update select state
+    void updateSelect(bool selected) {
+        selected_ = selected;
+    }
+
+    // Read the current rotation value
+    int readRotation() const {
+        return rotation_;
+    }
+
+    // Check if the knob is selected
+    bool isSelected() const {
+        return selected_;
+    }
+
+    // get previous BA
+    std::pair<int, int> getPrevBA() const {
+        return prevBA_;
+    }    
+
+private:
+    int minRotation_;
+    int maxRotation_;
+    int rotation_;
+    int prevDirection_;
+    bool selected_;
+    std::pair<int, int> prevBA_;
+
+};
+
+
 struct
 {
   std::bitset<32> inputs;
+  SemaphoreHandle_t mutex;
+  std::array<Knob, 4> knobs;
 } sysState;
 
 std::bitset<4> readCols()
@@ -78,15 +151,17 @@ void setOutMuxBit(const uint8_t bitIdx, const bool value)
   digitalWrite(REN_PIN, LOW);
 }
 
-// Write a new function that will update the phase accumulator and
-// set the analogue output voltage at each sample interval
+// update the phase accumulator and set the analogue output voltage at each sample interval
 // The function will be triggered by an interrupt 22,000 times per second.
 // It will add currentStepSize to the phase accumulator to generate the output waveform.
 void sampleISR()
 {
   static uint32_t phaseAcc = 0;
+  //__atomic_load_n(&currentStepSize, __ATOMIC_RELAXED);
   phaseAcc += currentStepSize;
   int32_t Vout = (phaseAcc >> 24) - 128;
+  // adjust the volume of the output signal based on rotation of knob 3
+  Vout = Vout >> (8 - sysState.knobs[3].readRotation());
   analogWrite(OUTR_PIN, Vout + 128);
 }
 
@@ -128,18 +203,67 @@ const uint32_t stepSizes[] = {
     calculateStepSize(noteFrequencies[11])  // B
 };
 
+// Function to update the rotation and selection state of 4 knobs
+void updateKnobStates(const std::bitset<32>& inputs, std::array<Knob, 4>& knobs) {
+    // Update knob states based on inputs
+    for (int i = 0; i < 4; ++i) {
+        // Determine the bit positions for the rotation and select signals of the current knob
+        int rotationBitPos, selectBitPos;
+        switch (i) {
+            case 0:
+                rotationBitPos = 18;
+                selectBitPos = 24;
+                break;
+            case 1:
+                rotationBitPos = 16;
+                selectBitPos = 25;
+                break;
+            case 2:
+                rotationBitPos = 14;
+                selectBitPos = 20;
+                break;
+            case 3:
+                rotationBitPos = 12;
+                selectBitPos = 21;
+                break;
+            default:
+                // Handle error or unexpected case
+                break;
+        }
+
+        // Update rotation state
+        std::pair<int, int> prevKnobState = knobs[i].getPrevBA();
+        std::pair<int, int> currentKnobState = {inputs[rotationBitPos + 1], inputs[rotationBitPos]};
+        knobs[i].updateRotation(prevKnobState, currentKnobState);
+
+        // Update select state
+        bool selectState = !inputs[selectBitPos];
+        knobs[i].updateSelect(selectState);
+    }
+}
+
+
+
 void scanKeysTask(void *pvParameters)
 {
-  const TickType_t xFrequency = 50 / portTICK_PERIOD_MS; // initiation interval: 50ms
+  const TickType_t xFrequency = 20 / portTICK_PERIOD_MS; // initiation interval: 50ms
   TickType_t xLastWakeTime = xTaskGetTickCount();
   // define a local currentStepSize variable to store the current step size
   uint32_t currentStepSizeLocal;
+
+  // Initialize knob objects within the sysState object
+  sysState.knobs[0] = Knob();
+  sysState.knobs[1] = Knob();
+  sysState.knobs[2] = Knob();
+  sysState.knobs[3] = Knob();
+
   while (1)
   {
     vTaskDelayUntil(&xLastWakeTime, xFrequency);
     currentStepSizeLocal = 0;
-    // key scanning loop and it loops over the row numbers 0 to 2.
-    for (int i = 0; i < 3; i++)
+    xSemaphoreTake(sysState.mutex, portMAX_DELAY);
+    // key scanning loop and it loops over the row numbers 0 to 3, including all the keys and Knob 3&2
+    for (int i = 0; i < 7; i++)
     {
       setRow(i);
       delayMicroseconds(3);
@@ -159,12 +283,17 @@ void scanKeysTask(void *pvParameters)
     }
     for (int i = 0; i < 12; i++)
     {
-      if (!sysState.inputs[i])
+      //Serial.println(sysState.inputs[i]);
+      if ((i < 12) && (!sysState.inputs[i]))
       {
         currentStepSizeLocal = stepSizes[i];
         break; // Exit the loop once a key is pressed
       }
     }
+
+    // Update knob states
+    updateKnobStates(sysState.inputs, sysState.knobs);
+    xSemaphoreGive(sysState.mutex);
     __atomic_store_n(&currentStepSize, currentStepSizeLocal, __ATOMIC_RELAXED);
   }
 }
@@ -184,6 +313,7 @@ void displayUpdateTask(void *pvParameters)
     u8g2.setFont(u8g2_font_ncenB08_tr);   // choose a suitable font
     u8g2.drawStr(2, 10, "Helllo World!"); // write something to the internal memory
     u8g2.setCursor(2, 20);
+    xSemaphoreTake(sysState.mutex, portMAX_DELAY);
     u8g2.print(sysState.inputs.to_ulong(), HEX);
     for (int i = 0; i < 12; i++)
     {
@@ -193,6 +323,7 @@ void displayUpdateTask(void *pvParameters)
         {
           // Print the note if it hasn't been printed yet
           u8g2.setCursor(2, 30);
+          u8g2.print("Note: ");
           u8g2.print(notes[i]);
           // Serial.println(notes[i]);
           notePrinted = true; // Set the flag to indicate the note has been printed
@@ -200,6 +331,11 @@ void displayUpdateTask(void *pvParameters)
         break; // Exit the loop once a key is pressed
       }
     }
+    u8g2.setCursor(60, 20);
+    u8g2.print("Vol: ");
+    u8g2.print(sysState.knobs[3].readRotation());
+    u8g2.print(sysState.knobs[3].isSelected() ? "selected" : "not");
+    xSemaphoreGive(sysState.mutex);
     u8g2.sendBuffer(); // transfer internal memory to the display
     // digitalToggle(LED_BUILTIN);
   }
@@ -262,6 +398,9 @@ void setup()
       NULL,             /* Parameter passed into the task */
       2,                /* Task priority */
       &scanKeysHandle); /* Pointer to store the task handle */
+
+  // create the mutex and assign its handle
+  sysState.mutex = xSemaphoreCreateMutex();
 
   // start the RTOS scheduler
   vTaskStartScheduler();
